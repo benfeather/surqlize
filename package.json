@@ -49,7 +49,7 @@
 		"type-check": "tsc --noEmit",
 		"qc": "biome check .",
 		"qa": "biome check . --write",
-		"build": "tsup && bun check:dist",
+		"build": "tsup && bun run check:dist",
 		"check:dist": "tsc -p tsconfig.dist.json",
 		"prepublishOnly": "bun run build",
 		"qau": "biome check . --write --unsafe"
