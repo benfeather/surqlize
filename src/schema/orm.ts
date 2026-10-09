@@ -1,5 +1,10 @@
-import type { SurrealSession } from "surrealdb";
-import { RecordId, type RecordIdValue, Uuid } from "surrealdb";
+import {
+	Duration,
+	GeometryPoint,
+	RecordId,
+	type RecordIdValue,
+	Uuid,
+} from "surrealdb";
 import { OrmError } from "../error";
 import type { Query } from "../query/abstract";
 import { ApiClient } from "../query/api";
@@ -9,6 +14,7 @@ import { DeleteQuery } from "../query/delete";
 import { InsertQuery } from "../query/insert";
 import { LiveQuery } from "../query/live";
 import { RelateQuery } from "../query/relate";
+import type { SurrealConnection } from "../query/request";
 import { SelectQuery } from "../query/select";
 import type { Transaction } from "../query/transaction";
 import { UpdateQuery } from "../query/update";
@@ -18,12 +24,14 @@ import {
 	type ArrayType,
 	type BoolType,
 	type DateType,
+	type DurationType,
 	type GraphType,
 	type NeverType,
 	type NoneType,
 	type NullType,
 	type NumberType,
 	type ObjectType,
+	type PointType,
 	type RecordType,
 	type StringType,
 	t,
@@ -115,23 +123,29 @@ export type ValueType<V> =
 						? BoolType
 						: V extends Date
 							? DateType
-							: V extends Uuid
-								? UuidType
-								: V extends null
-									? NullType
-									: V extends undefined
-										? NoneType
-										: V extends readonly unknown[]
-											? ValueArrayType<V>
-											: V extends Record<string, unknown>
-												? ObjectType<ValueObjectFields<V>>
-												: AbstractType;
+							: V extends Duration
+								? DurationType
+								: V extends Uuid
+									? UuidType
+									: V extends GeometryPoint
+										? PointType
+										: V extends null
+											? NullType
+											: V extends undefined
+												? NoneType
+												: V extends readonly unknown[]
+													? ValueArrayType<V>
+													: V extends Record<string, unknown>
+														? ObjectType<ValueObjectFields<V>>
+														: AbstractType;
 
 function typeFromValue(value: unknown): AbstractType {
 	if (isWorkable(value)) return value[__type];
 	if (value instanceof RecordId) return t.record(String(value.table));
 	if (value instanceof Date) return t.date();
+	if (value instanceof Duration) return t.duration();
 	if (value instanceof Uuid) return t.uuid();
+	if (value instanceof GeometryPoint) return t.point();
 	if (value === null) return t.null();
 	if (value === undefined) return t.none();
 
@@ -170,7 +184,7 @@ function typeFromValue(value: unknown): AbstractType {
  */
 export class Orm<T extends AnyTable[] = AnyTable[]> {
 	constructor(
-		public readonly surreal: SurrealSession,
+		public readonly surreal: SurrealConnection,
 		public readonly tables: MappedTables<T>,
 		public readonly lookup: CreateSchemaLookup<T>,
 	) {}
@@ -558,8 +572,39 @@ export class Orm<T extends AnyTable[] = AnyTable[]> {
 	}
 
 	/**
-	 * Combine multiple queries into a single atomic batch operation wrapped in
-	 * `BEGIN TRANSACTION; ...; COMMIT TRANSACTION;`.
+	 * Create a view of this ORM in which every query is abandoned when `signal`
+	 * aborts, which is how the work of a request handler is tied to the signal of
+	 * the request without passing it to every query:
+	 *
+	 * ```ts
+	 * const scoped = db.withSignal(request.signal);
+	 * const users = await scoped.select("user");
+	 * ```
+	 *
+	 * The view shares the connection and session of this ORM and changes neither,
+	 * so it is cheap to make one per request. Batches, transactions and live
+	 * subscriptions made through it are bound to the signal as well; a live
+	 * subscription is killed when the signal aborts.
+	 *
+	 * Aborting means "stop waiting", and nothing more: a write that was already
+	 * sent may or may not have been applied.
+	 */
+	withSignal(signal: AbortSignal | undefined): Orm<T> {
+		return new Orm<T>(
+			this.surreal.withSignal(signal),
+			this.tables,
+			this.lookup,
+		);
+	}
+
+	/**
+	 * Combine multiple queries into a single request that is applied atomically:
+	 * either every query takes effect or none does. Resolves to a tuple with the
+	 * result of each query.
+	 *
+	 * The batch runs as a stateless transaction, so it works over HTTP as well as
+	 * WebSockets, and can be configured with `.retry()`, `.signal()` and
+	 * `.requestTimeout()`.
 	 *
 	 * @param queries - The queries to batch together.
 	 * @returns A {@link BatchQuery} that can be awaited.
@@ -635,7 +680,8 @@ function isSchemaMap(value: unknown): value is SchemaMap {
  * object — both produce an identical, fully typed ORM. Tables are always
  * addressed by their `tb` name in queries, regardless of how they are passed.
  *
- * @param surreal - An active SurrealDB session.
+ * @param surreal - An active SurrealDB session, or a request scope made with
+ *   `withSignal()`.
  * @param tables - One or more {@link TableSchema} or {@link EdgeSchema} definitions.
  * @returns An {@link Orm} instance with query builders scoped to the provided schemas.
  *
@@ -658,15 +704,15 @@ function isSchemaMap(value: unknown): value is SchemaMap {
  * ```
  */
 export function orm<T extends AnyTable[]>(
-	surreal: SurrealSession,
+	surreal: SurrealConnection,
 	...tables: T
 ): Orm<T>;
 export function orm<S extends SchemaMap>(
-	surreal: SurrealSession,
+	surreal: SurrealConnection,
 	schema: S,
 ): Orm<SchemaMapTables<S>>;
 export function orm(
-	surreal: SurrealSession,
+	surreal: SurrealConnection,
 	...args: AnyTable[] | [SchemaMap]
 ): Orm {
 	const tables: AnyTable[] =

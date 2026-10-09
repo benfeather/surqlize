@@ -10,6 +10,7 @@ import {
 	OptionType,
 	RecordType,
 	t,
+	UnionType,
 } from "../types";
 import { type Actionable, actionable } from "../utils/actionable.ts";
 import { type DisplayContext, displayContext } from "../utils/display.ts";
@@ -29,7 +30,7 @@ import {
 	type Workable,
 	type WorkableContext,
 } from "../utils/workable.ts";
-import { Query } from "./abstract.ts";
+import { Query, type QueryResult } from "./abstract.ts";
 import { type ResolveEntry, resolveSubjectSchema } from "./subject.ts";
 import { escapeIdiomPath } from "./utils.ts";
 
@@ -89,11 +90,17 @@ type ResolveLink<O extends Orm, F extends AbstractType> =
 		? Tb extends keyof O["tables"] & string
 			? O["tables"][Tb]["schema"]
 			: F
-		: F extends OptionType<infer Inner extends AbstractType>
-			? OptionType<ResolveLink<O, Inner>>
-			: F extends ArrayType<infer Inner extends AbstractType>
-				? ArrayType<ResolveLink<O, Inner>>
-				: F;
+		: F extends UnionType<infer Members extends AbstractType[]>
+			? UnionType<{
+					[K in keyof Members]: Members[K] extends AbstractType
+						? ResolveLink<O, Members[K]>
+						: never;
+				}>
+			: F extends OptionType<infer Inner extends AbstractType>
+				? OptionType<ResolveLink<O, Inner>>
+				: F extends ArrayType<infer Inner extends AbstractType>
+					? ArrayType<ResolveLink<O, Inner>>
+					: F;
 
 /**
  * Resolve a record link and then continue fetching `Tails` within the resolved
@@ -109,13 +116,19 @@ type ResolveNested<
 		? Tb extends keyof O["tables"] & string
 			? FetchedSchema<O, O["tables"][Tb]["schema"], Tails>
 			: F
-		: F extends OptionType<infer Inner extends AbstractType>
-			? OptionType<ResolveNested<O, Inner, Tails>>
-			: F extends ArrayType<infer Inner extends AbstractType>
-				? ArrayType<ResolveNested<O, Inner, Tails>>
-				: F extends ObjectType<ObjectTypeInner>
-					? FetchedSchema<O, F, Tails>
-					: F;
+		: F extends UnionType<infer Members extends AbstractType[]>
+			? UnionType<{
+					[K in keyof Members]: Members[K] extends AbstractType
+						? ResolveNested<O, Members[K], Tails>
+						: never;
+				}>
+			: F extends OptionType<infer Inner extends AbstractType>
+				? OptionType<ResolveNested<O, Inner, Tails>>
+				: F extends ArrayType<infer Inner extends AbstractType>
+					? ArrayType<ResolveNested<O, Inner, Tails>>
+					: F extends ObjectType<ObjectTypeInner>
+						? FetchedSchema<O, F, Tails>
+						: F;
 
 /** Resolve a single fetched field given the nested paths (if any) beneath it. */
 type FetchField<O extends Orm, F extends AbstractType, Tails extends string> = [
@@ -151,8 +164,10 @@ export class SelectQuery<
 	C extends WorkableContext<O>,
 	T extends keyof O["tables"] & string,
 	E extends AbstractType = O["tables"][T]["schema"],
-> extends Query<C, ArrayType<E>> {
+	Only extends boolean = false,
+> extends Query<C, QueryResult<E, Only>> {
 	readonly [__ctx]: C;
+	private _only = false;
 	private _start?: number;
 	private _limit?: number;
 	private _filter?: Workable<C>;
@@ -218,8 +233,17 @@ export class SelectQuery<
 			resolveSubjectSchema(this[__ctx].orm, this.tb)) as E;
 	}
 
-	get [__type](): ArrayType<E> {
-		return t.array(this.entry);
+	get [__type](): QueryResult<E, Only> {
+		return (this._only ? this.entry : t.array(this.entry)) as QueryResult<
+			E,
+			Only
+		>;
+	}
+
+	only(): SelectQuery<O, C, T, E, true> {
+		return this.derive((next) => {
+			next._only = true;
+		}) as SelectQuery<O, C, T, E, true>;
 	}
 
 	/**
@@ -250,7 +274,7 @@ export class SelectQuery<
 				RowTraversal<C, T> &
 				RowExtend<C, ResolveEntry<E>>,
 		) => P,
-	): SelectQuery<O, C, T, R> {
+	): SelectQuery<O, C, T, R, Only> {
 		const tb = this.rowActionable(this.entry) as Actionable<
 			C,
 			ResolveEntry<E>
@@ -265,8 +289,8 @@ export class SelectQuery<
 		const entry = sanitizeWorkable(workable);
 
 		return this.derive((next) => {
-			(next as unknown as SelectQuery<O, C, T, R>)._entry = entry;
-		}) as unknown as SelectQuery<O, C, T, R>;
+			(next as unknown as SelectQuery<O, C, T, R, Only>)._entry = entry;
+		}) as unknown as SelectQuery<O, C, T, R, Only>;
 	}
 
 	where(
@@ -381,7 +405,7 @@ export class SelectQuery<
 
 	fetch<P extends FetchPaths<O, T>>(
 		...fields: P[]
-	): SelectQuery<O, C, T, FetchedSchema<O, E, P>> {
+	): SelectQuery<O, C, T, FetchedSchema<O, E, P>, Only> {
 		// Build a resolved schema where fetched record references are replaced
 		// with the referenced table's ObjectType schema, recursing into nested
 		// paths so parse() validates the resolved objects instead of expecting
@@ -397,7 +421,7 @@ export class SelectQuery<
 		return this.derive((next) => {
 			next._fetch = fields;
 			if (resolved) next._fetchResolvedType = resolved;
-		}) as unknown as SelectQuery<O, C, T, FetchedSchema<O, E, P>>;
+		}) as unknown as SelectQuery<O, C, T, FetchedSchema<O, E, P>, Only>;
 	}
 
 	timeout(duration: string): this {
@@ -447,7 +471,7 @@ export class SelectQuery<
 		const predicates = this._entry
 			? /* surql */ `VALUE ${this._entry[__display](ctx)}`
 			: "*";
-		let query = /* surql */ `SELECT ${predicates} FROM ${thing}`;
+		let query = /* surql */ `SELECT ${predicates} FROM ${this._only ? "ONLY " : ""}${thing}`;
 
 		if (this._filter)
 			query += /* surql */ ` WHERE ${this._filter[__display](ctx)}`;
@@ -518,27 +542,61 @@ function resolveFetchField(
 	orm: Orm,
 ): AbstractType {
 	if (fieldType instanceof RecordType) {
-		const tb = fieldType.tb;
-		// A multi-table link (`record<a | b>`) has no single schema to expand
-		// into, so leave it unresolved rather than coercing the array to a key.
-		if (typeof tb === "string") {
-			const target = orm.tables[tb];
-			if (target) {
-				return tails.length === 0
-					? target.schema
-					: resolveFetchObject(target.schema, tails, orm);
-			}
-		}
-		return fieldType;
+		return resolveFetchRecord(fieldType, tails, orm);
+	}
+	if (fieldType instanceof UnionType) {
+		return new UnionType(
+			fieldType.schema.map((member: AbstractType) =>
+				resolveFetchField(member, tails, orm),
+			),
+		);
 	}
 	if (fieldType instanceof OptionType) {
 		return new OptionType(resolveFetchField(fieldType.schema, tails, orm));
 	}
-	if (fieldType instanceof ArrayType && !Array.isArray(fieldType.schema)) {
-		return new ArrayType(resolveFetchField(fieldType.schema, tails, orm));
+	if (fieldType instanceof ArrayType) {
+		return resolveFetchArray(fieldType, tails, orm);
 	}
 	if (fieldType instanceof ObjectType && tails.length > 0) {
 		return resolveFetchObject(fieldType, tails, orm);
 	}
 	return fieldType;
+}
+
+function resolveFetchRecord(
+	fieldType: RecordType,
+	tails: string[],
+	orm: Orm,
+): AbstractType {
+	const tb = fieldType.tb;
+
+	if (typeof tb === "string") {
+		const target = orm.tables[tb];
+		if (!target) return fieldType;
+		return tails.length === 0
+			? target.schema
+			: resolveFetchObject(target.schema, tails, orm);
+	}
+
+	if (!Array.isArray(tb)) return fieldType;
+
+	const targets = tb.map((table) => orm.tables[table]);
+	if (!targets.every((target) => target)) return fieldType;
+
+	return new UnionType(
+		targets.map((target) =>
+			tails.length === 0
+				? target!.schema
+				: resolveFetchObject(target!.schema, tails, orm),
+		),
+	);
+}
+
+function resolveFetchArray(
+	fieldType: ArrayType,
+	tails: string[],
+	orm: Orm,
+): AbstractType {
+	if (Array.isArray(fieldType.schema)) return fieldType;
+	return new ArrayType(resolveFetchField(fieldType.schema, tails, orm));
 }

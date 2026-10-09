@@ -4,9 +4,10 @@ import {
 	type AbstractType,
 	ArrayType,
 	GraphType,
-	type ObjectType,
+	ObjectType,
 	OptionType,
 	RecordType,
+	UnionType,
 } from "../types";
 import type { DisplayContext } from "./display";
 
@@ -106,6 +107,16 @@ function resolveAccessType(
 		if (schema) return { target: schema, rewrap: (f) => f };
 	}
 
+	if (type instanceof UnionType) {
+		const schemas = type.schema.filter(
+			(member: AbstractType): member is ObjectType =>
+				member instanceof ObjectType,
+		);
+		if (schemas.length === type.schema.length && schemas.length > 0) {
+			return { target: mergeSchemas(schemas), rewrap: (f) => f };
+		}
+	}
+
 	return { target: type, rewrap: (f) => f };
 }
 
@@ -131,9 +142,10 @@ export function sanitizeWorkable<
 	C extends WorkableContext,
 	T extends AbstractType,
 >(workable: Workable<C, T>): Workable<C, T> {
+	const display = workable[__display].bind(workable);
 	return {
 		[__ctx]: workable[__ctx],
-		[__display]: workable[__display],
+		[__display]: display,
 		[__type]: workable[__type],
 	};
 }

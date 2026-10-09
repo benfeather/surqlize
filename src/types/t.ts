@@ -4,6 +4,7 @@ import {
 	ArrayType,
 	BoolType,
 	DateType,
+	DurationType,
 	LiteralType,
 	NeverType,
 	NoneType,
@@ -11,6 +12,7 @@ import {
 	NumberType,
 	ObjectType,
 	OptionType,
+	PointType,
 	RecordType,
 	StringType,
 	UnionType,
@@ -51,6 +53,16 @@ export function never() {
 /** Create a datetime type. */
 export function date() {
 	return new DateType();
+}
+
+/** Create a duration type. */
+export function duration() {
+	return new DurationType();
+}
+
+/** Create a native SurrealDB point type. */
+export function point() {
+	return new PointType();
 }
 
 /** Create a UUID type. */
